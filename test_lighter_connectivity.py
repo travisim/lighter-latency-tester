@@ -2,7 +2,7 @@
 """
 Lighter Connectivity & Latency Tester
 
-Tests geo-blocking, maker order latency, and taker order latency against Lighter exchange.
+Tests geo-blocking and taker order latency against Lighter exchange.
 Designed to be scp'd to fresh AWS instances for region-comparison testing.
 
 Usage:
@@ -55,9 +55,6 @@ class Results:
         self.preflight_ok = False
         self.balance_usdc = None
         self.position_str = "UNKNOWN"
-        self.maker_place_ms = None
-        self.maker_cancel_ms = None
-        self.maker_error = None
         self.taker_buy_ms = None
         self.taker_sell_ms = None
         self.taker_error = None
@@ -91,7 +88,7 @@ def _print_summary():
 
     if results.geo_blocked:
         print("  Geo-Blocked:        YES")
-        print("  (Tests 2/3 skipped)")
+        print("  (Test skipped)")
     else:
         print("  Geo-Blocked:        NO")
 
@@ -100,25 +97,17 @@ def _print_summary():
     if results.orderbook_sub_ms is not None:
         print(f"  Orderbook Sub:      {results.orderbook_sub_ms:.0f}ms")
 
-    if results.maker_place_ms is not None:
-        print(f"  Maker Place (REST): {results.maker_place_ms:.0f}ms")
-    elif results.maker_error:
-        print(f"  Maker Place:        FAILED ({results.maker_error})")
-
-    if results.maker_cancel_ms is not None:
-        print(f"  Maker Cancel (REST):{results.maker_cancel_ms:.0f}ms")
-
     if results.taker_buy_ms is not None:
-        print(f"  Taker Fill (WS):    {results.taker_buy_ms:.0f}ms  (buy)")
+        print(f"  Taker BUY Latency:  {results.taker_buy_ms:.0f}ms")
     elif results.taker_error:
-        print(f"  Taker Fill:         FAILED ({results.taker_error})")
+        print(f"  Taker Test:         FAILED ({results.taker_error})")
 
     if results.taker_sell_ms is not None:
-        print(f"  Taker Fill (WS):    {results.taker_sell_ms:.0f}ms  (sell)")
+        print(f"  Taker SELL Latency: {results.taker_sell_ms:.0f}ms")
 
     if results.taker_buy_ms is not None and results.taker_sell_ms is not None:
         avg = (results.taker_buy_ms + results.taker_sell_ms) / 2
-        print(f"  Taker Fill (avg):   {avg:.0f}ms")
+        print(f"  Average Latency:    {avg:.0f}ms")
 
     print("=" * 60)
 
@@ -128,7 +117,7 @@ def _print_summary():
 # ------------------------------------------------------------------
 async def test_geo_block():
     """Connect to Lighter WS, subscribe to orderbook, detect geo-blocks."""
-    print("[1/3] Geo-Block Test")
+    print("[1/2] Geo-Block Test")
 
     t_start = time.perf_counter()
 
@@ -294,85 +283,50 @@ async def pre_flight():
 
 
 # ------------------------------------------------------------------
-# Test 2: Maker Order Latency (REST API)
+# Test 2: Taker Order Latency (WebSocket send, REST confirm)
 # ------------------------------------------------------------------
-async def test_maker_latency(signer, best_bid):
-    """Place a limit order far from market, measure latency, cancel it."""
-    print("[2/3] Maker Latency Test (REST API)")
-
-    if best_bid <= 0:
-        print("  SKIP: No valid best bid from orderbook")
-        results.maker_error = "no orderbook data"
-        print()
-        return
-
-    limit_price = best_bid * LIMIT_PRICE_DISCOUNT
-    price_int = int(limit_price * 100)  # 2 decimal places
-    size_wei = TEST_SIZE_WEI
-    size_eth = size_wei / 1e4
+async def _send_market_order_ws(signer, order_ws, size_wei, is_ask, worst_price):
+    """Sign a market order and send via WebSocket. Returns (order_index, ws_response, error)."""
     order_index = int(time.time() * 1000) % 2**31
 
-    print(f"  Limit BUY @ ${limit_price:.2f} ({size_eth:.4f} ETH)")
+    api_key_index, nonce = signer.nonce_manager.next_nonce()
+    tx_type, tx_info, tx_hash, err = signer.sign_create_order(
+        market_index=MARKET_INDEX,
+        client_order_index=order_index,
+        base_amount=size_wei,
+        price=worst_price,
+        is_ask=is_ask,
+        order_type=signer.ORDER_TYPE_MARKET,
+        time_in_force=signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+        order_expiry=signer.DEFAULT_IOC_EXPIRY,
+        nonce=nonce,
+        api_key_index=api_key_index,
+    )
+    if err is not None:
+        return order_index, None, f"sign: {err}"
 
-    # Place limit order
-    t_start = time.perf_counter()
+    payload = {
+        "type": "jsonapi/sendtx",
+        "data": {
+            "id": f"req_{int(time.time()*1000)}",
+            "tx_type": tx_type,
+            "tx_info": json.loads(tx_info),
+        },
+    }
+
+    await order_ws.send(json.dumps(payload))
+
+    # Read the sendtx response
     try:
-        tx, resp, err = await signer.create_order(
-            market_index=MARKET_INDEX,
-            client_order_index=order_index,
-            base_amount=size_wei,
-            price=price_int,
-            is_ask=False,  # BUY
-            order_type=signer.ORDER_TYPE_LIMIT,
-            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            order_expiry=signer.DEFAULT_28_DAY_ORDER_EXPIRY,
-        )
-        place_ms = (time.perf_counter() - t_start) * 1000
-
-        if err is not None:
-            print(f"  Order Place:       FAIL ({err})")
-            results.maker_error = str(err)
-            print()
-            return
-
-        results.maker_place_ms = place_ms
-        print(f"  Order Place:       {place_ms:.0f}ms")
-
-    except Exception as e:
-        place_ms = (time.perf_counter() - t_start) * 1000
-        print(f"  Order Place:       FAIL ({e}) [{place_ms:.0f}ms]")
-        results.maker_error = str(e)
-        print()
-        return
-
-    # Cancel the order
-    t_cancel = time.perf_counter()
-    try:
-        tx, resp, err = await signer.cancel_order(
-            market_index=MARKET_INDEX,
-            order_index=order_index,
-        )
-        cancel_ms = (time.perf_counter() - t_cancel) * 1000
-
-        if err is not None:
-            print(f"  Order Cancel:      WARN ({err}) [{cancel_ms:.0f}ms]")
-        else:
-            results.maker_cancel_ms = cancel_ms
-            print(f"  Order Cancel:      {cancel_ms:.0f}ms")
-
-    except Exception as e:
-        cancel_ms = (time.perf_counter() - t_cancel) * 1000
-        print(f"  Order Cancel:      WARN ({e}) [{cancel_ms:.0f}ms]")
-
-    print()
+        ws_resp = await asyncio.wait_for(order_ws.recv(), timeout=ORDER_TIMEOUT)
+        return order_index, ws_resp, None
+    except asyncio.TimeoutError:
+        return order_index, None, "ws response timeout"
 
 
-# ------------------------------------------------------------------
-# Test 3: Taker Order Latency (WebSocket)
-# ------------------------------------------------------------------
 async def test_taker_latency(signer, best_ask, best_bid):
-    """Place market BUY via WS, wait for fill, then SELL to flatten."""
-    print("[3/3] Taker Latency Test (WebSocket)")
+    """Place market BUY via WS, then SELL to flatten. Measure round-trip."""
+    print("[2/2] Taker Latency Test (WebSocket)")
 
     if best_ask <= 0 or best_bid <= 0:
         print("  SKIP: No valid orderbook data")
@@ -380,49 +334,22 @@ async def test_taker_latency(signer, best_ask, best_bid):
         print()
         return
 
-    # Set up fill detection via WsClient account subscription
-    fill_event = asyncio.Event()
-    fill_order_index = [None]  # mutable container for closure
-    pending_order_index = [None]
-
-    def on_orderbook_update(market_id, order_book):
-        pass  # we don't need orderbook updates here
-
-    def on_account_update(account_id, message):
-        if "orders" in message:
-            for order in message["orders"]:
-                oidx = order.get("order_index")
-                status = order.get("status")
-                if oidx == pending_order_index[0] and status == "filled":
-                    fill_order_index[0] = oidx
-                    fill_event.set()
-
-    # Start WsClient for account fill notifications
-    host = API_URL.replace("https://", "").replace("http://", "")
-    ws_client = WsClient(
-        host=host,
-        order_book_ids=[MARKET_INDEX],
-        account_ids=[ACCOUNT_INDEX],
-        on_order_book_update=on_orderbook_update,
-        on_account_update=on_account_update,
-    )
-
-    # Run WsClient in background
-    ws_task = asyncio.create_task(ws_client.run_async())
-
-    # Give it a moment to connect and subscribe
-    await asyncio.sleep(2)
-
-    # Open separate order WS for sending transactions
+    # Open order WS and drain initial "connected" message
     try:
         order_ws = await asyncio.wait_for(
-            websockets.connect(WS_URL),
+            websockets.connect(WS_URL, ping_interval=None),
             timeout=ORDER_TIMEOUT,
         )
+        # Drain the "connected" message so it doesn't interfere with order responses
+        init_msg = await asyncio.wait_for(order_ws.recv(), timeout=5)
+        init_data = json.loads(init_msg)
+        if init_data.get("type") == "connected":
+            print(f"  Order WS:          connected")
+        else:
+            print(f"  Order WS:          unexpected init: {init_data.get('type')}")
     except Exception as e:
         print(f"  Order WS Connect:  FAIL ({e})")
         results.taker_error = f"order ws connect: {e}"
-        ws_task.cancel()
         print()
         return
 
@@ -432,146 +359,97 @@ async def test_taker_latency(signer, best_ask, best_bid):
     # --- Market BUY ---
     print(f"  Market BUY {size_eth:.4f} ETH")
     worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
-    buy_order_index = int(time.time() * 1000) % 2**31
-    pending_order_index[0] = buy_order_index
 
-    try:
-        api_key_index, nonce = signer.nonce_manager.next_nonce()
-        tx_type, tx_info, tx_hash, err = signer.sign_create_order(
-            market_index=MARKET_INDEX,
-            client_order_index=buy_order_index,
-            base_amount=size_wei,
-            price=worst_buy_price,
-            is_ask=False,  # BUY
-            order_type=signer.ORDER_TYPE_MARKET,
-            time_in_force=signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-            order_expiry=signer.DEFAULT_IOC_EXPIRY,
-            nonce=nonce,
-            api_key_index=api_key_index,
-        )
+    t_buy_start = time.perf_counter()
+    oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, False, worst_buy_price)
+    buy_ms = (time.perf_counter() - t_buy_start) * 1000
 
-        if err is not None:
-            print(f"  Signing failed:    {err}")
-            results.taker_error = f"sign: {err}"
+    if err is not None:
+        print(f"  BUY failed:        {err}")
+        # Try with larger size
+        if size_wei == TEST_SIZE_WEI:
+            print(f"  Retrying with {FALLBACK_SIZE_WEI / 1e4:.4f} ETH...")
+            size_wei = FALLBACK_SIZE_WEI
+            size_eth = size_wei / 1e4
+            worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
+            t_buy_start = time.perf_counter()
+            oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, False, worst_buy_price)
+            buy_ms = (time.perf_counter() - t_buy_start) * 1000
+
+    if err is not None:
+        print(f"  BUY failed:        {err}")
+        results.taker_error = err
+        await order_ws.close()
+        print()
+        return
+
+    # Parse WS response to check for errors
+    resp_data = None
+    if ws_resp:
+        try:
+            resp_data = json.loads(ws_resp)
+            resp_str = json.dumps(resp_data, indent=None)
+            if len(resp_str) > 200:
+                resp_str = resp_str[:200] + "..."
+            print(f"  WS Response:       {resp_str}")
+        except json.JSONDecodeError:
+            print(f"  WS Response:       {ws_resp[:200]}")
+
+    # Check if the response indicates an error
+    if resp_data:
+        err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error")
+        if err_msg:
+            print(f"  BUY rejected:      {err_msg}")
+            results.taker_error = f"buy rejected: {err_msg}"
             await order_ws.close()
-            ws_task.cancel()
             print()
             return
 
-        # Send via WS and start timer
-        payload = {
-            "type": "jsonapi/sendtx",
-            "data": {
-                "id": f"req_{int(time.time()*1000)}",
-                "tx_type": tx_type,
-                "tx_info": json.loads(tx_info),
-            },
-        }
-
-        fill_event.clear()
-        t_buy_start = time.perf_counter()
-        await order_ws.send(json.dumps(payload))
-
-        # Read WS response (order ack)
-        try:
-            ws_resp = await asyncio.wait_for(order_ws.recv(), timeout=ORDER_TIMEOUT)
-        except asyncio.TimeoutError:
-            print(f"  Order WS response: TIMEOUT")
-
-        # Wait for fill notification from account WS
-        try:
-            await asyncio.wait_for(fill_event.wait(), timeout=ORDER_TIMEOUT)
-            buy_ms = (time.perf_counter() - t_buy_start) * 1000
-            results.taker_buy_ms = buy_ms
-            print(f"  Order -> Fill:     {buy_ms:.0f}ms")
-        except asyncio.TimeoutError:
-            buy_ms = (time.perf_counter() - t_buy_start) * 1000
-            print(f"  Order -> Fill:     TIMEOUT ({buy_ms:.0f}ms elapsed)")
-            results.taker_error = "buy fill timeout"
-            # Still try to flatten
-    except Exception as e:
-        print(f"  Market BUY:        FAIL ({e})")
-        results.taker_error = str(e)
-        await order_ws.close()
-        ws_task.cancel()
-        print()
-        return
+    results.taker_buy_ms = buy_ms
+    print(f"  BUY round-trip:    {buy_ms:.0f}ms")
 
     # --- Market SELL (flatten) ---
     print(f"  Market SELL {size_eth:.4f} ETH (flatten)")
     worst_sell_price = int(best_bid * (1 - SLIPPAGE) * 100)
-    sell_order_index = int(time.time() * 1000) % 2**31
-    pending_order_index[0] = sell_order_index
 
-    retries = 3
-    for attempt in range(retries):
-        try:
-            api_key_index, nonce = signer.nonce_manager.next_nonce()
-            tx_type, tx_info, tx_hash, err = signer.sign_create_order(
-                market_index=MARKET_INDEX,
-                client_order_index=sell_order_index,
-                base_amount=size_wei,
-                price=worst_sell_price,
-                is_ask=True,  # SELL
-                order_type=signer.ORDER_TYPE_MARKET,
-                time_in_force=signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                order_expiry=signer.DEFAULT_IOC_EXPIRY,
-                nonce=nonce,
-                api_key_index=api_key_index,
-            )
+    for attempt in range(3):
+        t_sell_start = time.perf_counter()
+        oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, True, worst_sell_price)
+        sell_ms = (time.perf_counter() - t_sell_start) * 1000
 
-            if err is not None:
-                print(f"  Signing failed:    {err} (attempt {attempt+1}/{retries})")
-                if attempt < retries - 1:
+        if err is not None:
+            print(f"  SELL failed:       {err} (attempt {attempt+1}/3)")
+            if attempt < 2:
+                await asyncio.sleep(1)
+                continue
+            results.taker_error = f"sell: {err}"
+            break
+
+        # Parse response
+        if ws_resp:
+            try:
+                resp_data = json.loads(ws_resp)
+                resp_str = json.dumps(resp_data, indent=None)
+                if len(resp_str) > 200:
+                    resp_str = resp_str[:200] + "..."
+                print(f"  WS Response:       {resp_str}")
+            except json.JSONDecodeError:
+                print(f"  WS Response:       {ws_resp[:200]}")
+
+            err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error") if resp_data else None
+            if err_msg:
+                print(f"  SELL rejected:     {err_msg} (attempt {attempt+1}/3)")
+                if attempt < 2:
                     await asyncio.sleep(1)
-                    sell_order_index = int(time.time() * 1000) % 2**31
-                    pending_order_index[0] = sell_order_index
                     continue
-                results.taker_error = f"sell sign: {err}"
+                results.taker_error = f"sell rejected: {err_msg}"
                 break
 
-            payload = {
-                "type": "jsonapi/sendtx",
-                "data": {
-                    "id": f"req_{int(time.time()*1000)}",
-                    "tx_type": tx_type,
-                    "tx_info": json.loads(tx_info),
-                },
-            }
-
-            fill_event.clear()
-            t_sell_start = time.perf_counter()
-            await order_ws.send(json.dumps(payload))
-
-            try:
-                ws_resp = await asyncio.wait_for(order_ws.recv(), timeout=ORDER_TIMEOUT)
-            except asyncio.TimeoutError:
-                print(f"  Order WS response: TIMEOUT")
-
-            try:
-                await asyncio.wait_for(fill_event.wait(), timeout=ORDER_TIMEOUT)
-                sell_ms = (time.perf_counter() - t_sell_start) * 1000
-                results.taker_sell_ms = sell_ms
-                print(f"  Order -> Fill:     {sell_ms:.0f}ms")
-                break  # success
-            except asyncio.TimeoutError:
-                sell_ms = (time.perf_counter() - t_sell_start) * 1000
-                print(f"  Order -> Fill:     TIMEOUT ({sell_ms:.0f}ms, attempt {attempt+1}/{retries})")
-                if attempt == retries - 1:
-                    results.taker_error = "sell fill timeout"
-
-        except Exception as e:
-            print(f"  Market SELL:       FAIL ({e}, attempt {attempt+1}/{retries})")
-            if attempt == retries - 1:
-                results.taker_error = str(e)
+        results.taker_sell_ms = sell_ms
+        print(f"  SELL round-trip:   {sell_ms:.0f}ms")
+        break
 
     await order_ws.close()
-    ws_task.cancel()
-    try:
-        await ws_task
-    except (asyncio.CancelledError, Exception):
-        pass
-
     print()
 
 
@@ -695,10 +573,7 @@ async def main():
         _print_summary()
         return 2
 
-    # Test 2: Maker latency
-    await test_maker_latency(signer, results.best_bid)
-
-    # Test 3: Taker latency
+    # Test 2: Taker latency (buy + sell)
     await test_taker_latency(signer, results.best_ask, results.best_bid)
 
     # Cleanup
@@ -707,7 +582,7 @@ async def main():
     _print_summary()
 
     # Determine exit code
-    if results.maker_error and results.taker_error:
+    if results.taker_error:
         return 3
     return 0
 
