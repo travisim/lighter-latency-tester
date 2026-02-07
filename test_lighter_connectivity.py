@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 import websockets
 
 import lighter
-from lighter import WsClient, AccountApi
+from lighter import AccountApi
 
 # ============================================================
 # === EDIT THESE ===
@@ -283,7 +283,7 @@ async def pre_flight():
 
 
 # ------------------------------------------------------------------
-# Test 2: Taker Order Latency (WebSocket send, REST confirm)
+# Test 2: Taker Order Latency (WebSocket)
 # ------------------------------------------------------------------
 async def _send_market_order_ws(signer, order_ws, size_wei, is_ask, worst_price):
     """Sign a market order and send via WebSocket. Returns (order_index, ws_response, error)."""
@@ -316,7 +316,6 @@ async def _send_market_order_ws(signer, order_ws, size_wei, is_ask, worst_price)
 
     await order_ws.send(json.dumps(payload))
 
-    # Read the sendtx response
     try:
         ws_resp = await asyncio.wait_for(order_ws.recv(), timeout=ORDER_TIMEOUT)
         return order_index, ws_resp, None
@@ -395,7 +394,6 @@ async def test_taker_latency(signer, best_ask, best_bid):
         except json.JSONDecodeError:
             print(f"  WS Response:       {ws_resp[:200]}")
 
-    # Check if the response indicates an error
     if resp_data:
         err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error")
         if err_msg:
@@ -426,6 +424,7 @@ async def test_taker_latency(signer, best_ask, best_bid):
             break
 
         # Parse response
+        resp_data = None
         if ws_resp:
             try:
                 resp_data = json.loads(ws_resp)
