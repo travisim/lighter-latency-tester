@@ -42,6 +42,11 @@ LIMIT_PRICE_DISCOUNT = 0.95  # 5% below best bid
 # WS URL derived from API URL
 WS_URL = API_URL.replace("https://", "wss://") + "/stream"
 
+# Binance Futures
+BINANCE_WS_URL = "wss://fstream.binance.com/ws/btcusdt@bookTicker"
+BINANCE_SAMPLE_COUNT = 20
+BINANCE_TIMEOUT = 10  # seconds
+
 
 class Results:
     """Collects test results for summary output."""
@@ -60,6 +65,15 @@ class Results:
         self.taker_error = None
         self.cleanup_position = "UNKNOWN"
         self.cleanup_balance = None
+        # Binance
+        self.binance_ws_connect_ms = None
+        self.binance_ping_rtt_ms = None
+        self.binance_latency_min_ms = None
+        self.binance_latency_median_ms = None
+        self.binance_latency_max_ms = None
+        self.binance_best_bid = None
+        self.binance_best_ask = None
+        self.binance_error = None
 
 
 results = Results()
@@ -71,7 +85,7 @@ _cleanup_done = False
 
 def _print_header():
     print("=" * 60)
-    print("LIGHTER CONNECTIVITY & LATENCY TEST")
+    print("CONNECTIVITY & LATENCY TEST")
     print("=" * 60)
     host = API_URL.replace("https://", "").replace("http://", "")
     print(f"Endpoint: {host}")
@@ -85,6 +99,25 @@ def _print_summary():
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
+
+    # Binance section
+    if results.binance_ws_connect_ms is not None or results.binance_error:
+        print("  --- Binance BTCUSDT Perps ---")
+        if results.binance_ws_connect_ms is not None:
+            print(f"  WS Connect:         {results.binance_ws_connect_ms:.0f}ms")
+        if results.binance_ping_rtt_ms is not None:
+            print(f"  WS Ping RTT:        {results.binance_ping_rtt_ms:.0f}ms (one-way est: {results.binance_ping_rtt_ms/2:.0f}ms)")
+        if results.binance_latency_median_ms is not None:
+            print(f"  Ticker Latency:     {results.binance_latency_median_ms:.0f}ms (median, N={BINANCE_SAMPLE_COUNT})")
+            print(f"    Min: {results.binance_latency_min_ms:.0f}ms  Max: {results.binance_latency_max_ms:.0f}ms")
+        if results.binance_best_bid is not None:
+            print(f"  Best Bid: ${results.binance_best_bid:.2f}  Best Ask: ${results.binance_best_ask:.2f}")
+        if results.binance_error:
+            print(f"  Error:              {results.binance_error}")
+        print()
+
+    # Lighter section
+    print("  --- Lighter ETH/USDT.p ---")
 
     if results.geo_blocked:
         print("  Geo-Blocked:        YES")
@@ -110,6 +143,82 @@ def _print_summary():
         print(f"  Average Latency:    {avg:.0f}ms")
 
     print("=" * 60)
+
+
+# ------------------------------------------------------------------
+# Test 0: Binance Perps Ticker Latency
+# ------------------------------------------------------------------
+async def test_binance_latency():
+    """Measure latency to Binance USDM futures bookTicker stream."""
+    print("[Binance] BTCUSDT Perps Ticker Latency")
+
+    # --- WS Connect ---
+    t_start = time.perf_counter()
+    try:
+        ws = await asyncio.wait_for(
+            websockets.connect(BINANCE_WS_URL, ping_interval=None, close_timeout=5),
+            timeout=BINANCE_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"  WS Connect:        FAIL ({e})")
+        results.binance_error = str(e)
+        print()
+        return
+
+    connect_ms = (time.perf_counter() - t_start) * 1000
+    results.binance_ws_connect_ms = connect_ms
+    print(f"  WS Connect:        {connect_ms:.0f}ms")
+
+    # --- WS Ping RTT ---
+    try:
+        t_ping = time.perf_counter()
+        pong = await ws.ping()
+        await asyncio.wait_for(pong, timeout=5)
+        ping_rtt_ms = (time.perf_counter() - t_ping) * 1000
+        results.binance_ping_rtt_ms = ping_rtt_ms
+        print(f"  WS Ping RTT:       {ping_rtt_ms:.0f}ms (one-way est: {ping_rtt_ms/2:.0f}ms)")
+    except Exception as e:
+        print(f"  WS Ping:           FAIL ({e})")
+
+    # --- Collect bookTicker samples ---
+    latencies = []
+    best_bid = 0.0
+    best_ask = 0.0
+    try:
+        for _ in range(BINANCE_SAMPLE_COUNT):
+            raw = await asyncio.wait_for(ws.recv(), timeout=BINANCE_TIMEOUT)
+            t_recv = time.time() * 1000  # epoch ms
+            msg = json.loads(raw)
+
+            if msg.get("e") == "bookTicker":
+                server_time = msg["E"]
+                latency = t_recv - server_time
+                latencies.append(latency)
+                best_bid = float(msg["b"])
+                best_ask = float(msg["a"])
+    except asyncio.TimeoutError:
+        print(f"  Ticker stream:     TIMEOUT (got {len(latencies)}/{BINANCE_SAMPLE_COUNT} samples)")
+    except Exception as e:
+        print(f"  Ticker stream:     ERROR ({e})")
+
+    await ws.close()
+
+    if latencies:
+        latencies.sort()
+        results.binance_latency_min_ms = latencies[0]
+        results.binance_latency_median_ms = latencies[len(latencies) // 2]
+        results.binance_latency_max_ms = latencies[-1]
+        results.binance_best_bid = best_bid
+        results.binance_best_ask = best_ask
+
+        print(f"  Ticker Latency:    {results.binance_latency_median_ms:.0f}ms (median, N={len(latencies)})")
+        print(f"    Min: {results.binance_latency_min_ms:.0f}ms  Max: {results.binance_latency_max_ms:.0f}ms")
+        print(f"  Best Bid: ${best_bid:.2f}  Best Ask: ${best_ask:.2f}")
+    else:
+        results.binance_error = "no samples received"
+        print("  Ticker Latency:    NO DATA")
+
+    print()
 
 
 # ------------------------------------------------------------------
@@ -553,6 +662,9 @@ async def main():
     signal.signal(signal.SIGINT, _sigint_handler)
 
     _print_header()
+
+    # Test 0: Binance latency (baseline)
+    await test_binance_latency()
 
     # Test 1: Geo-block
     await test_geo_block()
