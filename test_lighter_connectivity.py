@@ -38,6 +38,7 @@ FALLBACK_SIZE_WEI = 100  # 0.01 ETH if 0.001 rejected
 GEO_BLOCK_TIMEOUT = 10  # seconds
 ORDER_TIMEOUT = 10  # seconds
 LIMIT_PRICE_DISCOUNT = 0.95  # 5% below best bid
+FILL_TIMEOUT = 5  # seconds to wait for fill notification after ack
 
 # WS URL derived from API URL
 WS_URL = API_URL.replace("https://", "wss://") + "/stream"
@@ -60,11 +61,19 @@ class Results:
         self.preflight_ok = False
         self.balance_usdc = None
         self.position_str = "UNKNOWN"
-        self.taker_buy_ms = None
-        self.taker_sell_ms = None
         self.taker_error = None
         self.cleanup_position = "UNKNOWN"
         self.cleanup_balance = None
+        # Signal-to-fill breakdown
+        self.fill_listener_setup_ms = None
+        self.taker_buy_signing_ms = None
+        self.taker_buy_send_to_ack_ms = None
+        self.taker_buy_ack_to_fill_ms = None  # None = no fill / timeout
+        self.taker_buy_s2f_ms = None
+        self.taker_sell_signing_ms = None
+        self.taker_sell_send_to_ack_ms = None
+        self.taker_sell_ack_to_fill_ms = None
+        self.taker_sell_s2f_ms = None
         # Binance
         self.binance_ws_connect_ms = None
         self.binance_ping_rtt_ms = None
@@ -129,18 +138,41 @@ def _print_summary():
         print(f"  WS Connect:         {results.ws_connect_ms:.0f}ms")
     if results.orderbook_sub_ms is not None:
         print(f"  Orderbook Sub:      {results.orderbook_sub_ms:.0f}ms")
+    if results.fill_listener_setup_ms is not None:
+        print(f"  Fill Listener:      {results.fill_listener_setup_ms:.0f}ms (setup)")
 
-    if results.taker_buy_ms is not None:
-        print(f"  Taker BUY Latency:  {results.taker_buy_ms:.0f}ms")
-    elif results.taker_error:
+    if results.taker_error:
         print(f"  Taker Test:         FAILED ({results.taker_error})")
 
-    if results.taker_sell_ms is not None:
-        print(f"  Taker SELL Latency: {results.taker_sell_ms:.0f}ms")
+    if results.taker_buy_s2f_ms is not None or results.taker_buy_send_to_ack_ms is not None:
+        print(f"  Taker BUY:")
+        if results.taker_buy_signing_ms is not None:
+            print(f"    Signing:          {results.taker_buy_signing_ms:.0f}ms")
+        if results.taker_buy_send_to_ack_ms is not None:
+            print(f"    Send -> Ack:      {results.taker_buy_send_to_ack_ms:.0f}ms")
+        if results.taker_buy_ack_to_fill_ms is not None:
+            print(f"    Ack -> Fill:      {results.taker_buy_ack_to_fill_ms:.0f}ms")
+        else:
+            print(f"    Ack -> Fill:      TIMEOUT")
+        if results.taker_buy_s2f_ms is not None:
+            print(f"    Total S2F:        {results.taker_buy_s2f_ms:.0f}ms")
 
-    if results.taker_buy_ms is not None and results.taker_sell_ms is not None:
-        avg = (results.taker_buy_ms + results.taker_sell_ms) / 2
-        print(f"  Average Latency:    {avg:.0f}ms")
+    if results.taker_sell_s2f_ms is not None or results.taker_sell_send_to_ack_ms is not None:
+        print(f"  Taker SELL:")
+        if results.taker_sell_signing_ms is not None:
+            print(f"    Signing:          {results.taker_sell_signing_ms:.0f}ms")
+        if results.taker_sell_send_to_ack_ms is not None:
+            print(f"    Send -> Ack:      {results.taker_sell_send_to_ack_ms:.0f}ms")
+        if results.taker_sell_ack_to_fill_ms is not None:
+            print(f"    Ack -> Fill:      {results.taker_sell_ack_to_fill_ms:.0f}ms")
+        else:
+            print(f"    Ack -> Fill:      TIMEOUT")
+        if results.taker_sell_s2f_ms is not None:
+            print(f"    Total S2F:        {results.taker_sell_s2f_ms:.0f}ms")
+
+    if results.taker_buy_s2f_ms is not None and results.taker_sell_s2f_ms is not None:
+        avg = (results.taker_buy_s2f_ms + results.taker_sell_s2f_ms) / 2
+        print(f"  Average S2F:        {avg:.0f}ms")
 
     print("=" * 60)
 
@@ -394,8 +426,8 @@ async def pre_flight():
 # ------------------------------------------------------------------
 # Test 2: Taker Order Latency (WebSocket)
 # ------------------------------------------------------------------
-async def _send_market_order_ws(signer, order_ws, size_wei, is_ask, worst_price):
-    """Sign a market order and send via WebSocket. Returns (order_index, ws_response, error)."""
+def _sign_order(signer, size_wei, is_ask, worst_price):
+    """Sign a market order. Returns (order_index, payload_dict, error)."""
     order_index = int(time.time() * 1000) % 2**31
 
     api_key_index, nonce = signer.nonce_manager.next_nonce()
@@ -422,19 +454,189 @@ async def _send_market_order_ws(signer, order_ws, size_wei, is_ask, worst_price)
             "tx_info": json.loads(tx_info),
         },
     }
+    return order_index, payload, None
+
+
+async def _send_and_measure(signer, order_ws, size_wei, is_ask, worst_price):
+    """Sign and send a market order, capturing granular timestamps.
+
+    Returns (order_index, t0, t1, t3, ws_response, error).
+    t0 = signal (before signing), t1 = signing done, t3 = ack received.
+    """
+    t0 = time.perf_counter()
+    order_index, payload, err = _sign_order(signer, size_wei, is_ask, worst_price)
+    t1 = time.perf_counter()
+
+    if err is not None:
+        return order_index, t0, t1, None, None, err
 
     await order_ws.send(json.dumps(payload))
 
     try:
         ws_resp = await asyncio.wait_for(order_ws.recv(), timeout=ORDER_TIMEOUT)
-        return order_index, ws_resp, None
+        t3 = time.perf_counter()
+        return order_index, t0, t1, t3, ws_resp, None
     except asyncio.TimeoutError:
-        return order_index, None, "ws response timeout"
+        return order_index, t0, t1, None, None, "ws response timeout"
+
+
+def _is_fill_for_order(msg, order_index, is_ask):
+    """Check if a WS trade message corresponds to our order.
+
+    For a BUY (is_ask=False), we are the bid side.
+    For a SELL (is_ask=True), we are the ask side.
+    """
+    msg_type = msg.get("type", "")
+    # Accept both account_all_trades and account_all update messages
+    if "update" not in msg_type:
+        return False
+
+    # Look for trades in the message — the format may be:
+    # {"trades": {"0": [...]}} keyed by market_index, or
+    # {"trades": [...]} as a flat list
+    trades = msg.get("trades", {})
+    if isinstance(trades, dict):
+        # Keyed by market_index
+        market_trades = trades.get(str(MARKET_INDEX), [])
+    elif isinstance(trades, list):
+        market_trades = trades
+    else:
+        return False
+
+    for trade in market_trades:
+        # Match by account_id
+        if is_ask:
+            acct_id = trade.get("ask_account_id")
+            client_id = trade.get("ask_client_id")
+        else:
+            acct_id = trade.get("bid_account_id")
+            client_id = trade.get("bid_client_id")
+
+        if acct_id is not None and int(acct_id) != ACCOUNT_INDEX:
+            continue
+
+        # If client_order_index is present, match it
+        if client_id is not None and int(client_id) == order_index:
+            return True
+
+        # If no client_id field or it doesn't match, accept by account_id alone
+        if acct_id is not None and int(acct_id) == ACCOUNT_INDEX:
+            return True
+
+    return False
+
+
+async def _wait_for_fill(fill_ws, order_index, is_ask, timeout=FILL_TIMEOUT):
+    """Wait for a fill notification on the fill listener WS.
+
+    Handles ping/pong and filters for our specific order.
+    Returns the fill message or None on timeout.
+    """
+    deadline = time.perf_counter() + timeout
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return None
+        try:
+            raw = await asyncio.wait_for(fill_ws.recv(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        msg = json.loads(raw)
+        if msg.get("type") == "ping":
+            await fill_ws.send(json.dumps({"type": "pong"}))
+            continue
+        if _is_fill_for_order(msg, order_index, is_ask):
+            return msg
+
+
+async def _setup_fill_listener():
+    """Connect fill listener WS and subscribe to account trades.
+
+    Returns (fill_ws, setup_ms) or (None, None) on failure.
+    """
+    t_start = time.perf_counter()
+    try:
+        fill_ws = await asyncio.wait_for(
+            websockets.connect(WS_URL, ping_interval=None, close_timeout=5),
+            timeout=GEO_BLOCK_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"  Fill Listener:     FAIL connect ({e})")
+        return None, None
+
+    # Drain "connected" message
+    try:
+        init_msg = await asyncio.wait_for(fill_ws.recv(), timeout=5)
+        init_data = json.loads(init_msg)
+        if init_data.get("type") != "connected":
+            print(f"  Fill Listener:     unexpected init: {init_data.get('type')}")
+    except Exception as e:
+        print(f"  Fill Listener:     no connected msg ({e})")
+        await fill_ws.close()
+        return None, None
+
+    # Subscribe to account trades
+    channel = f"account_all_trades/{ACCOUNT_INDEX}"
+    await fill_ws.send(json.dumps({"type": "subscribe", "channel": channel}))
+
+    # Drain subscription snapshot
+    try:
+        while True:
+            raw = await asyncio.wait_for(fill_ws.recv(), timeout=5)
+            data = json.loads(raw)
+            msg_type = data.get("type", "")
+            if msg_type == "ping":
+                await fill_ws.send(json.dumps({"type": "pong"}))
+                continue
+            if "subscribed" in msg_type:
+                break
+            # If we get an error, the channel might not exist
+            if "error" in msg_type or data.get("error"):
+                err_msg = data.get("error", msg_type)
+                print(f"  Fill Listener:     subscription error: {err_msg}")
+                print(f"  Fill Listener:     falling back to account_all/{ACCOUNT_INDEX}")
+                # Fallback: try account_all channel
+                channel = f"account_all/{ACCOUNT_INDEX}"
+                await fill_ws.send(json.dumps({"type": "subscribe", "channel": channel}))
+                raw2 = await asyncio.wait_for(fill_ws.recv(), timeout=5)
+                data2 = json.loads(raw2)
+                if "subscribed" in data2.get("type", ""):
+                    break
+                print(f"  Fill Listener:     fallback also failed")
+                await fill_ws.close()
+                return None, None
+    except asyncio.TimeoutError:
+        print(f"  Fill Listener:     subscription timeout")
+        await fill_ws.close()
+        return None, None
+
+    setup_ms = (time.perf_counter() - t_start) * 1000
+    print(f"  Fill Listener:     ready ({setup_ms:.0f}ms, channel={channel})")
+    return fill_ws, setup_ms
+
+
+def _check_ack_error(ws_resp, label):
+    """Parse WS ack response and check for errors. Returns error message or None."""
+    if not ws_resp:
+        return None
+    try:
+        resp_data = json.loads(ws_resp)
+        resp_str = json.dumps(resp_data, indent=None)
+        if len(resp_str) > 200:
+            resp_str = resp_str[:200] + "..."
+        print(f"  WS Response:       {resp_str}")
+        err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error")
+        if err_msg:
+            print(f"  {label} rejected:     {err_msg}")
+            return f"{label.lower()} rejected: {err_msg}"
+    except json.JSONDecodeError:
+        print(f"  WS Response:       {ws_resp[:200]}")
+    return None
 
 
 async def test_taker_latency(signer, best_ask, best_bid):
-    """Place market BUY via WS, then SELL to flatten. Measure round-trip."""
-    print("[2/2] Taker Latency Test (WebSocket)")
+    """Place market BUY via WS, then SELL to flatten. Measure signal-to-fill latency."""
+    print("[2/2] Taker Signal-to-Fill Latency Test")
 
     if best_ask <= 0 or best_bid <= 0:
         print("  SKIP: No valid orderbook data")
@@ -442,122 +644,154 @@ async def test_taker_latency(signer, best_ask, best_bid):
         print()
         return
 
-    # Open order WS and drain initial "connected" message
+    fill_ws = None
+    order_ws = None
+
     try:
-        order_ws = await asyncio.wait_for(
-            websockets.connect(WS_URL, ping_interval=None),
-            timeout=ORDER_TIMEOUT,
-        )
-        # Drain the "connected" message so it doesn't interfere with order responses
-        init_msg = await asyncio.wait_for(order_ws.recv(), timeout=5)
-        init_data = json.loads(init_msg)
-        if init_data.get("type") == "connected":
-            print(f"  Order WS:          connected")
+        # --- Setup fill listener WS (must be ready before placing orders) ---
+        fill_ws, setup_ms = await _setup_fill_listener()
+        if fill_ws is None:
+            print("  WARNING: Fill listener failed — will measure ack latency only")
         else:
-            print(f"  Order WS:          unexpected init: {init_data.get('type')}")
-    except Exception as e:
-        print(f"  Order WS Connect:  FAIL ({e})")
-        results.taker_error = f"order ws connect: {e}"
-        print()
-        return
+            results.fill_listener_setup_ms = setup_ms
 
-    size_wei = TEST_SIZE_WEI
-    size_eth = size_wei / 1e4
-
-    # --- Market BUY ---
-    print(f"  Market BUY {size_eth:.4f} ETH")
-    worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
-
-    t_buy_start = time.perf_counter()
-    oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, False, worst_buy_price)
-    buy_ms = (time.perf_counter() - t_buy_start) * 1000
-
-    if err is not None:
-        print(f"  BUY failed:        {err}")
-        # Try with larger size
-        if size_wei == TEST_SIZE_WEI:
-            print(f"  Retrying with {FALLBACK_SIZE_WEI / 1e4:.4f} ETH...")
-            size_wei = FALLBACK_SIZE_WEI
-            size_eth = size_wei / 1e4
-            worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
-            t_buy_start = time.perf_counter()
-            oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, False, worst_buy_price)
-            buy_ms = (time.perf_counter() - t_buy_start) * 1000
-
-    if err is not None:
-        print(f"  BUY failed:        {err}")
-        results.taker_error = err
-        await order_ws.close()
-        print()
-        return
-
-    # Parse WS response to check for errors
-    resp_data = None
-    if ws_resp:
+        # --- Setup order sender WS ---
         try:
-            resp_data = json.loads(ws_resp)
-            resp_str = json.dumps(resp_data, indent=None)
-            if len(resp_str) > 200:
-                resp_str = resp_str[:200] + "..."
-            print(f"  WS Response:       {resp_str}")
-        except json.JSONDecodeError:
-            print(f"  WS Response:       {ws_resp[:200]}")
-
-    if resp_data:
-        err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error")
-        if err_msg:
-            print(f"  BUY rejected:      {err_msg}")
-            results.taker_error = f"buy rejected: {err_msg}"
-            await order_ws.close()
+            order_ws = await asyncio.wait_for(
+                websockets.connect(WS_URL, ping_interval=None),
+                timeout=ORDER_TIMEOUT,
+            )
+            init_msg = await asyncio.wait_for(order_ws.recv(), timeout=5)
+            init_data = json.loads(init_msg)
+            if init_data.get("type") == "connected":
+                print(f"  Order WS:          connected")
+            else:
+                print(f"  Order WS:          unexpected init: {init_data.get('type')}")
+        except Exception as e:
+            print(f"  Order WS Connect:  FAIL ({e})")
+            results.taker_error = f"order ws connect: {e}"
             print()
             return
 
-    results.taker_buy_ms = buy_ms
-    print(f"  BUY round-trip:    {buy_ms:.0f}ms")
+        size_wei = TEST_SIZE_WEI
+        size_eth = size_wei / 1e4
 
-    # --- Market SELL (flatten) ---
-    print(f"  Market SELL {size_eth:.4f} ETH (flatten)")
-    worst_sell_price = int(best_bid * (1 - SLIPPAGE) * 100)
+        # --- Market BUY ---
+        print(f"  Market BUY {size_eth:.4f} ETH")
+        worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
 
-    for attempt in range(3):
-        t_sell_start = time.perf_counter()
-        oidx, ws_resp, err = await _send_market_order_ws(signer, order_ws, size_wei, True, worst_sell_price)
-        sell_ms = (time.perf_counter() - t_sell_start) * 1000
+        oidx, t0, t1, t3, ws_resp, err = await _send_and_measure(
+            signer, order_ws, size_wei, False, worst_buy_price
+        )
 
         if err is not None:
-            print(f"  SELL failed:       {err} (attempt {attempt+1}/3)")
-            if attempt < 2:
-                await asyncio.sleep(1)
-                continue
-            results.taker_error = f"sell: {err}"
-            break
+            print(f"  BUY failed:        {err}")
+            if size_wei == TEST_SIZE_WEI:
+                print(f"  Retrying with {FALLBACK_SIZE_WEI / 1e4:.4f} ETH...")
+                size_wei = FALLBACK_SIZE_WEI
+                size_eth = size_wei / 1e4
+                worst_buy_price = int(best_ask * (1 + SLIPPAGE) * 100)
+                oidx, t0, t1, t3, ws_resp, err = await _send_and_measure(
+                    signer, order_ws, size_wei, False, worst_buy_price
+                )
 
-        # Parse response
-        resp_data = None
-        if ws_resp:
-            try:
-                resp_data = json.loads(ws_resp)
-                resp_str = json.dumps(resp_data, indent=None)
-                if len(resp_str) > 200:
-                    resp_str = resp_str[:200] + "..."
-                print(f"  WS Response:       {resp_str}")
-            except json.JSONDecodeError:
-                print(f"  WS Response:       {ws_resp[:200]}")
+        if err is not None:
+            print(f"  BUY failed:        {err}")
+            results.taker_error = err
+            print()
+            return
 
-            err_msg = resp_data.get("error") or resp_data.get("data", {}).get("error") if resp_data else None
-            if err_msg:
-                print(f"  SELL rejected:     {err_msg} (attempt {attempt+1}/3)")
+        ack_err = _check_ack_error(ws_resp, "BUY")
+        if ack_err:
+            results.taker_error = ack_err
+            print()
+            return
+
+        # Store signing and ack timing
+        results.taker_buy_signing_ms = (t1 - t0) * 1000
+        results.taker_buy_send_to_ack_ms = (t3 - t1) * 1000
+        print(f"  BUY Signing:       {results.taker_buy_signing_ms:.0f}ms")
+        print(f"  BUY Send->Ack:     {results.taker_buy_send_to_ack_ms:.0f}ms")
+
+        # Wait for fill
+        if fill_ws is not None:
+            fill_msg = await _wait_for_fill(fill_ws, oidx, False)
+            if fill_msg is not None:
+                t4 = time.perf_counter()
+                results.taker_buy_ack_to_fill_ms = (t4 - t3) * 1000
+                results.taker_buy_s2f_ms = (t4 - t0) * 1000
+                print(f"  BUY Ack->Fill:     {results.taker_buy_ack_to_fill_ms:.0f}ms")
+                print(f"  BUY Total S2F:     {results.taker_buy_s2f_ms:.0f}ms")
+            else:
+                print(f"  BUY Ack->Fill:     TIMEOUT ({FILL_TIMEOUT}s) — IOC likely expired unfilled")
+                # Still report what we have (ack-based)
+                results.taker_buy_s2f_ms = None
+        else:
+            # No fill listener — report ack-based timing only
+            results.taker_buy_s2f_ms = (t3 - t0) * 1000
+            print(f"  BUY Total (ack):   {results.taker_buy_s2f_ms:.0f}ms (no fill listener)")
+
+        # --- Market SELL (flatten) ---
+        print(f"  Market SELL {size_eth:.4f} ETH (flatten)")
+        worst_sell_price = int(best_bid * (1 - SLIPPAGE) * 100)
+
+        for attempt in range(3):
+            oidx, t0, t1, t3, ws_resp, err = await _send_and_measure(
+                signer, order_ws, size_wei, True, worst_sell_price
+            )
+
+            if err is not None:
+                print(f"  SELL failed:       {err} (attempt {attempt+1}/3)")
                 if attempt < 2:
                     await asyncio.sleep(1)
                     continue
-                results.taker_error = f"sell rejected: {err_msg}"
+                results.taker_error = f"sell: {err}"
                 break
 
-        results.taker_sell_ms = sell_ms
-        print(f"  SELL round-trip:   {sell_ms:.0f}ms")
-        break
+            ack_err = _check_ack_error(ws_resp, "SELL")
+            if ack_err:
+                if attempt < 2:
+                    print(f"  (attempt {attempt+1}/3)")
+                    await asyncio.sleep(1)
+                    continue
+                results.taker_error = ack_err
+                break
 
-    await order_ws.close()
+            # Store signing and ack timing
+            results.taker_sell_signing_ms = (t1 - t0) * 1000
+            results.taker_sell_send_to_ack_ms = (t3 - t1) * 1000
+            print(f"  SELL Signing:      {results.taker_sell_signing_ms:.0f}ms")
+            print(f"  SELL Send->Ack:    {results.taker_sell_send_to_ack_ms:.0f}ms")
+
+            # Wait for fill
+            if fill_ws is not None:
+                fill_msg = await _wait_for_fill(fill_ws, oidx, True)
+                if fill_msg is not None:
+                    t4 = time.perf_counter()
+                    results.taker_sell_ack_to_fill_ms = (t4 - t3) * 1000
+                    results.taker_sell_s2f_ms = (t4 - t0) * 1000
+                    print(f"  SELL Ack->Fill:    {results.taker_sell_ack_to_fill_ms:.0f}ms")
+                    print(f"  SELL Total S2F:    {results.taker_sell_s2f_ms:.0f}ms")
+                else:
+                    print(f"  SELL Ack->Fill:    TIMEOUT ({FILL_TIMEOUT}s)")
+                    results.taker_sell_s2f_ms = None
+            else:
+                results.taker_sell_s2f_ms = (t3 - t0) * 1000
+                print(f"  SELL Total (ack):  {results.taker_sell_s2f_ms:.0f}ms (no fill listener)")
+            break
+
+    finally:
+        if order_ws is not None:
+            try:
+                await order_ws.close()
+            except Exception:
+                pass
+        if fill_ws is not None:
+            try:
+                await fill_ws.close()
+            except Exception:
+                pass
+
     print()
 
 
